@@ -1,0 +1,160 @@
+import pandas as pd
+import os
+import re
+import nltk 
+import logging
+
+from jinja2 import Environment
+from datetime import datetime
+
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer 
+from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
+
+from processor.base import BaseProcessor
+from util.string_util import clean_text
+from util.path import path_resource
+
+class NgramProcessor(BaseProcessor):
+
+    def __init__(self, project_name, project_topic, subject_file_path, *args, **kwargs):
+        super(NgramProcessor, self).__init__(*args, **kwargs)
+        self.project_name = project_name
+        self.project_topic = project_topic
+        self.subject_file_path = subject_file_path
+
+    def process(self, df, context, *args, **kwargs):
+
+        if df is None or df.shape[0] == 0:
+            self.data_count = 0
+            return None
+
+        # stopwords preparation
+        stopwords = self.get_stopword(os.path.join(path_resource(), "modal"))
+        sastrawi_stopwords = StopWordRemoverFactory().create_stop_word_remover()
+
+        # data preparation
+        df_cleaned_sw = df.copy()
+        df_cleaned_sw['cleaned_content'] = df_cleaned_sw['content'].apply(self.remove_stopwords, args=[stopwords, sastrawi_stopwords])
+        period_start = df.iloc[0]["period_start"]
+        period_end = df.iloc[0]["period_end"]
+
+        log_str = "Extracting features from {}...".format(self.project_topic)
+        logging.info(log_str)
+
+        unique_text = df_cleaned_sw.cleaned_content.to_list()
+        keywords = self.get_subject_keyword(self.subject_file_path)
+
+        # get top 100 ngram features
+        df_ngrams = self.get_top_ngrams(unique_text)
+        if df_ngrams.empty:
+            return None
+        df_ngrams = df_ngrams[~df_ngrams.term.isin(keywords)]
+        df_ngrams = df_ngrams.head(100)
+
+        # get tweet containing features count
+        df_ngrams['news_count'] = df_ngrams.term.apply(self.get_news_count, args=[df_cleaned_sw])
+        df_ngrams['project_topic'] = self.project_topic
+        df_ngrams_final = df_ngrams.apply(self.get_tweet_example, axis=1, args=[df_cleaned_sw])
+
+        # append data
+        df_final = df_ngrams_final.copy()
+
+        log_str = "Features from subject {} has been extracted.".format(self.project_topic)
+        logging.info(log_str)
+
+        df_final['period_start'] = period_start
+        df_final['period_end'] = period_end
+        df_final = df_final.loc[:,['period_start','period_end','project_topic','term','tfidf_score','news_count',
+                                    'news_example','date','content','media','author','tags','link']]
+        self.data_count = df_final.shape[0]
+        return df_final
+
+    def get_stopword(self, path):
+        files = [
+        'indonesian.stp',
+        'stop_all.txt',
+        'twitter_stp.dic',
+        'konjungsi.txt',
+        'pengubah.txt',
+        'jabatan_publik.txt',
+        'time.txt'
+        ]
+
+        stopwords = []
+        for file in files:
+            with open(os.path.join(path, file)) as f:
+                temp = f.read().splitlines()
+                stopwords += temp
+        stopwords = list(set(stopwords))
+        """for key in additional_keywords:
+            stopwords.append(key)
+        """
+        return stopwords
+
+    def remove_stopwords(self, x, stopword_list, sastrawi_stopwords):
+        new_sentence = x
+        new_sentence = re.sub(r'\d+', '', new_sentence)
+        new_sentence = sastrawi_stopwords.remove(new_sentence)
+        
+        result = []
+        words = new_sentence.strip().split(' ')
+        for term in words:
+            if(term not in stopword_list and len(term) > 3):
+                result.append(term)
+        new_sentence = " ".join(result)
+        return new_sentence
+
+    def get_top_ngrams(self, text_list):
+        # Getting unigrams, bigrams, and trigrams  
+        vectorizer = CountVectorizer(ngram_range = (1,3)) 
+        try:
+            X1 = vectorizer.fit_transform(text_list)  
+        except ValueError as ve: 
+            logging.warning(ve)
+            logging.info("The news only contain empty string.")
+            return pd.DataFrame()
+        features = (vectorizer.get_feature_names())
+
+        # Applying TFIDF to unigrams, bigrams, and trigrams
+        vectorizer = TfidfVectorizer(ngram_range = (1,3)) 
+        X2 = vectorizer.fit_transform(text_list)
+        
+        # Getting top ranking features 
+        sums = X2.sum(axis = 0) 
+        data = [] 
+        for col, term in enumerate(features): 
+            data.append((term, sums[0,col] )) 
+        ranking = pd.DataFrame(data, columns = ['term','tfidf_score']) 
+        words = (ranking.sort_values('tfidf_score', ascending = False)) 
+
+        return words
+
+    def get_news_count(self, term, df_all):
+        df_news = df_all[df_all.cleaned_content.str.contains(term)]
+        return len(df_news.link.unique())
+
+    def get_subject_keyword(self, path):
+        data = pd.read_csv(path, sep=";")
+        keywords = []
+        for _, row in data.iterrows():
+            key = re.sub(r"[\[\]\"]", "", row['keywords'])
+            key = key.replace(", ",",")
+            key = key.split(",")
+            keywords += key
+        if not keywords:
+            return keywords
+        vectorizer = CountVectorizer(ngram_range = (1,3)) 
+        X = vectorizer.fit_transform(keywords)
+        keywords = (vectorizer.get_feature_names())
+        return keywords
+
+    def get_tweet_example(self, df_term, df_all):
+        term = df_term['term']
+        news_example = df_all[df_all.cleaned_content.str.contains(term)].iloc[0]
+        result = pd.Series([df_term['term'], df_term['tfidf_score'], df_term['news_count'], df_term['project_topic'],
+                            news_example['title'], news_example['date'], news_example['content'],
+                            news_example['media'], news_example['author'], news_example['tags'],
+                            news_example['link']],
+                            index=['term','tfidf_score','news_count','project_topic','news_example','date',
+                                    'content','media','author', 'tags', 'link'])
+        return result
